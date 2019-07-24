@@ -1,0 +1,125 @@
+#!/bin/bash
+
+apt-get install -y nginx php php-fpm php-mysql zip sendmail
+add-apt-repository -y universe
+add-apt-repository -y ppa:certbot/certbot
+apt-get update
+apt-get install -y certbot python-certbot-nginx
+FILE=/usr/local/bin/wp
+if [ -f "$FILE" ]; then
+    echo "wp-cli is already installed. Nothing do to."
+else
+    cd /tmp && curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x wp-cli.phar && sudo mv wp-cli.phar /usr/local/bin/wp
+fi
+
+# Functions Required for the Wordpress Install
+create_wp_install () {
+	wget -q https://wordpress.org/latest.zip -P /var/www/
+	echo "Latest.zip downloaded"
+	unzip -q /var/www/latest.zip -d /var/www/
+	echo "latest.zip has been unzipped"
+	mv /var/www/wordpress /home/$username/public_html
+	echo "wordpress moved to home directory"
+	rm /var/www/latest.zip
+	echo "Clean up completed."
+}
+
+create_site_database () {
+	#create Database
+	database=db$(cat /dev/urandom | tr -dc '0-9' | fold -w 10 | head -n 1)
+	if [ -d /var/lib/mysql/$database ] ; then
+		create_site_database
+	else
+		mysql -e "CREATE DATABASE $database;"
+		echo "Database created: $database"
+		touch /root/accounts/$username
+		echo $database >> /root/accounts/$username
+		create_site_datauser
+	fi
+}
+
+create_site_datauser () {
+	#create database user and grant privileges
+	datauser=ss$(cat /dev/urandom | tr -dc '0-9' | fold -w 10 | head -n 1)
+        datapass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 30 | head -n 1)
+        datapref=wp_$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 10 | head -n 1)_
+	mysql -e "CREATE USER '$datauser'@'localhost' IDENTIFIED WITH mysql_native_password BY '$datapass';"
+	mysql -e "GRANT ALL PRIVILEGES ON $database.* TO '$datauser'@'localhost';"
+	mysql -e "FLUSH PRIVILEGES;"
+	echo "Database user added: $datauser"
+	create_wpconfig_file
+}
+
+create_wpconfig_file () {
+	cp /home/$username/public_html/wp-config-sample.php /home/$username/public_html/wp-config.php
+	#set database credentials
+	  #database
+	databaseString='database_name_here'
+	  #database user
+	datauserString='username_here'
+	  #database password
+	datapassString='password_here'
+	  #database prefix
+	dataprefString='wp_'
+	sed -i -e 's/'"$databaseString"'/'"$database"'/g' -e 's/'"$datauserString"'/'"$datauser"'/g' -e 's/'"$datapassString"'/'"$datapass"'/g' -e 's/'"$dataprefString"'/'"$datapref"'/g' /home/$username/public_html/wp-config.php
+	  #create SALTS
+	salts=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+	saltsString='put your unique phrase here'
+	printf '%s\n' "g/$saltsString/d" a "$salts" . w | ed -s /home/$username/public_html/wp-config.php
+	echo "wp-config.php created"
+	chown $username:$username -R /home/$username
+	echo "user directory permissions set"
+	echo "New site has been added."
+
+}
+
+create_php_pool () {
+  cp php_pool.tpl /etc/php/7.2/fpm/pool.d/$username.conf
+	sed -i -e 's/${username}/'"$username"'/g' /etc/php/7.2/fpm/pool.d/$username.conf
+	service php7.2-fpm restart
+}
+
+config_nginx_site () {
+	cp nginx_config.tpl /etc/nginx/sites-available/$domain.conf
+	sed -i -e 's/${domain}/'"$domain"'/g' -e 's/${username}/'"$username"'/g' /etc/nginx/sites-available/$domain.conf
+	ln -s /etc/nginx/sites-available/$domain.conf /etc/nginx/sites-enabled/
+	mkdir /home/$username/log
+	mkdir /home/$username/log/nginx
+	chown -R $username:$username /home/$username
+	service nginx restart
+}
+
+# Check and add crontab
+if [[ $(crontab -l | egrep -v "^(#|$)" | grep -q 'certbot renew'; echo $?) == 1 ]]
+then
+    echo $(crontab -l ; echo '0 0 * * 0 "certbot renew"') | crontab -
+fi
+
+# Add User to System
+if [ $(id -u) -eq 0 ]; then
+	read -p "Username: " username
+	read -s -p "Password: " password
+	printf "\n"
+	read -p "Domain: " domain
+	read -p "Site Name: " sitename
+	read -p "Admin Email: " adminemail
+	egrep "^$username" /etc/passwd >/dev/null
+	if [ $? -eq 0 ]; then
+		echo "Username: $username already exists!"
+		exit 1
+	else
+		pass=$(perl -e 'print crypt($ARGV[0], "password")' $password)
+		groupadd $username
+		useradd -m -p $pass -g $username $username
+		[ $? -eq 0 ] && echo "User has been added to system!" || echo "Failed to add a user!"
+		create_php_pool
+		config_nginx_site
+		create_wp_install
+		create_site_database
+		sudo -u $username -i -- wp core install --path="/home/${username}/public_html" --url="${domain}" --title="${sitename}" --admin_user="${username}"  --admin_password="${password}" --admin_email="${adminemail}"
+		certbot --nginx
+	fi
+else
+	echo "Only root may add a user to the system."
+	exit 2
+fi
